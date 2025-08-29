@@ -1,0 +1,531 @@
+/*
+ * ESP32-C6 Multi-Gas Spoilage Detection - Fixed Version
+ * Removed Cross-Sensitivity Compensation - Using Basic Curves Only
+ * 
+ * Hardware: ESP32-C6, MQ-137/136/135/4, DHT22, RGB LED
+ * Voltage Divider: 10kΩ series, 20kΩ to ground (Config A - 2/3 ratio)
+ * 
+ * IMPORTANT: Set DEVICE_ID (1-4) before uploading
+ */
+
+#include <WiFi.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <ArduinoJson.h>
+#include <Adafruit_NeoPixel.h>
+#include <DHT.h>
+#include <math.h>
+
+// ==================== CONFIGURATION ====================
+const int DEVICE_ID = 1;  // CHANGE THIS (1-4) for each device
+
+// Pin assignments
+#define MQ137_PIN    0    // NH3
+#define MQ136_PIN    1    // H2S  
+#define MQ135_PIN    2    // CO2
+#define MQ4_PIN      3    // CH4
+#define DHT_PIN      4
+#define DHT_TYPE     DHT22
+#define LED_PIN      8
+#define NUM_LEDS     1
+
+// Voltage divider: 10kΩ series, 20kΩ to ground
+#define VOLTAGE_DIVIDER_RATIO  0.667f  // 2/3 ratio (5V → 3.33V)
+#define VCC_SENSOR            5.0f
+#define VREF_ADC             3.3f
+
+// Sensor configuration
+#define NUM_SENSORS  4
+const float RL_VALUES[NUM_SENSORS] = {47.0f, 20.0f, 10.0f, 10.0f};
+const float RO_CLEAN_AIR_FACTORS[NUM_SENSORS] = {3.6f, 3.0f, 3.6f, 4.4f};
+
+// Sampling
+#define CALIBRATION_SAMPLES  30
+#define READ_SAMPLES        5
+#define WARMUP_TIME         30  // seconds
+
+// Data transmission
+#define DATA_INTERVAL       2000  // Send data every 2 seconds
+#define ANALYSIS_INTERVAL   5000  // Analyze spoilage every 5 seconds
+
+// ==================== SPOILAGE THRESHOLDS ====================
+struct Thresholds {
+  float fresh;
+  float warning;
+  float spoiling;
+  float spoiled;
+  float weight;
+};
+
+const Thresholds thresholds[NUM_SENSORS] = {
+  {2.0f, 5.0f, 15.0f, 30.0f, 0.35f},    // NH3 (MQ137)
+  {1.0f, 3.0f, 8.0f, 20.0f, 0.40f},     // H2S (MQ136)
+  {2.0f, 8.0f, 20.0f, 50.0f, 0.15f},    // CO2 (MQ135)
+  {5.0f, 20.0f, 50.0f, 100.0f, 0.10f}   // CH4 (MQ4)
+};
+
+// ==================== GLOBAL VARIABLES ====================
+Adafruit_NeoPixel rgbLed(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// Sensor data
+float ro_values[NUM_SENSORS] = {10.0f, 10.0f, 10.0f, 10.0f};
+float gas_ppm[NUM_SENSORS];
+float gas_filtered[NUM_SENSORS] = {0, 0, 0, 0};
+
+// Environmental
+float temperature = 20.0f;
+float humidity = 65.0f;
+
+// System state
+bool sensorsReady = false;
+int spoilageStage = 0;
+float systemConfidence = 0.0f;
+
+// BLE
+BLEServer* pServer = NULL;
+BLECharacteristic* pTxCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+// Timing
+unsigned long lastSensorRead = 0;
+unsigned long lastAnalysis = 0;
+unsigned long lastDataSent = 0;
+
+// ==================== CORE FUNCTIONS ====================
+
+float calculateResistance(float adc_value, float rl_value) {
+  if (adc_value <= 0) return 999999.0f;
+  if (adc_value >= 4095) return 0.1f;
+  
+  float v_adc = (adc_value / 4095.0f) * VREF_ADC;
+  float v_sensor = v_adc / VOLTAGE_DIVIDER_RATIO;
+  
+  if (v_sensor < 0.1f) v_sensor = 0.1f;
+  if (v_sensor > VCC_SENSOR - 0.1f) v_sensor = VCC_SENSOR - 0.1f;
+  
+  return rl_value * ((VCC_SENSOR / v_sensor) - 1.0f);
+}
+
+// Simplified PPM calculation using power law: ppm = A * (Rs/Ro)^B
+float calculatePPM_MQ137(float rs_ro_ratio) {
+  // NH3 curve for MQ-137: ppm = 102 * (Rs/Ro)^(-2.2)
+  if (rs_ro_ratio <= 0) return 0;
+  return 102.0f * pow(rs_ro_ratio, -2.2f);
+}
+
+float calculatePPM_MQ136(float rs_ro_ratio) {
+  // H2S curve for MQ-136: ppm = 30 * (Rs/Ro)^(-1.8)
+  if (rs_ro_ratio <= 0) return 0;
+  return 30.0f * pow(rs_ro_ratio, -1.8f);
+}
+
+float calculatePPM_MQ135(float rs_ro_ratio) {
+  // CO2 curve for MQ-135: ppm = 116.6 * (Rs/Ro)^(-2.769)
+  if (rs_ro_ratio <= 0) return 0;
+  return 116.6f * pow(rs_ro_ratio, -2.769f);
+}
+
+float calculatePPM_MQ4(float rs_ro_ratio) {
+  // CH4 curve for MQ-4: ppm = 1012.7 * (Rs/Ro)^(-2.786)
+  if (rs_ro_ratio <= 0) return 0;
+  return 1012.7f * pow(rs_ro_ratio, -2.786f);
+}
+
+float compensateEnvironment(float ppm, int gas_type, float temp, float hum) {
+  // Simple temperature and humidity compensation
+  float temp_coeffs[4] = {0.02f, 0.025f, 0.015f, 0.018f};
+  float temp_factor = 1.0f + temp_coeffs[gas_type] * (temp - 20.0f) / 20.0f;
+  float hum_factor = 1.0f + 0.002f * (hum - 65.0f);
+  
+  return ppm * temp_factor * hum_factor;
+}
+
+// ==================== SENSOR READING ====================
+
+void readGasSensors() {
+  const int pins[NUM_SENSORS] = {MQ137_PIN, MQ136_PIN, MQ135_PIN, MQ4_PIN};
+  
+  for (int sensor = 0; sensor < NUM_SENSORS; sensor++) {
+    float sum = 0;
+    for (int i = 0; i < READ_SAMPLES; i++) {
+      sum += analogRead(pins[sensor]);
+      delay(10);
+    }
+    float adc_avg = sum / READ_SAMPLES;
+    
+    float rs = calculateResistance(adc_avg, RL_VALUES[sensor]);
+    float ratio = rs / ro_values[sensor];
+    
+    // Calculate PPM using individual sensor curves
+    switch (sensor) {
+      case 0: gas_ppm[sensor] = calculatePPM_MQ137(ratio); break;
+      case 1: gas_ppm[sensor] = calculatePPM_MQ136(ratio); break;
+      case 2: gas_ppm[sensor] = calculatePPM_MQ135(ratio); break;
+      case 3: gas_ppm[sensor] = calculatePPM_MQ4(ratio); break;
+    }
+    
+    // Apply environmental compensation
+    gas_ppm[sensor] = compensateEnvironment(gas_ppm[sensor], sensor, temperature, humidity);
+    
+    // Simple exponential smoothing filter
+    const float alpha = 0.3f;
+    gas_filtered[sensor] = alpha * gas_ppm[sensor] + (1.0f - alpha) * gas_filtered[sensor];
+  }
+}
+
+// ==================== SPOILAGE DETECTION ====================
+
+int detectSpoilage() {
+  float score = 0.0f;
+  float total_weight = 0.0f;
+  float confidence = 0.0f;
+  
+  for (int gas = 0; gas < NUM_SENSORS; gas++) {
+    float level = gas_filtered[gas];
+    float weight = thresholds[gas].weight;
+    
+    if (level >= thresholds[gas].spoiled) {
+      score += 4.0f * weight;
+      confidence += weight;
+    } else if (level >= thresholds[gas].spoiling) {
+      score += 3.0f * weight;
+      confidence += weight * 0.8f;
+    } else if (level >= thresholds[gas].warning) {
+      score += 2.0f * weight;
+      confidence += weight * 0.6f;
+    } else if (level >= thresholds[gas].fresh) {
+      score += 1.0f * weight;
+      confidence += weight * 0.4f;
+    }
+    
+    total_weight += weight;
+  }
+  
+  if (total_weight > 0) {
+    score /= total_weight;
+    systemConfidence = confidence / total_weight;
+  }
+  
+  // Multi-gas confirmation bonus
+  int gases_detected = 0;
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (gas_filtered[i] > thresholds[i].fresh) gases_detected++;
+  }
+  if (gases_detected >= 2) {
+    systemConfidence = min(systemConfidence * 1.2f, 1.0f);
+  }
+  
+  if (score < 1.5f) return 0;      // Fresh
+  else if (score < 2.5f) return 1; // Warning
+  else if (score < 3.5f) return 2; // Spoiling
+  else return 3;                   // Spoiled
+}
+
+// ==================== CALIBRATION ====================
+
+void calibrateSensors() {
+  Serial.println("\n🔬 Calibrating sensors in clean air...");
+  const int pins[NUM_SENSORS] = {MQ137_PIN, MQ136_PIN, MQ135_PIN, MQ4_PIN};
+  const char* names[] = {"MQ137", "MQ136", "MQ135", "MQ4"};
+  
+  for (int sensor = 0; sensor < NUM_SENSORS; sensor++) {
+    float sum = 0;
+    
+    for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+      int adc = analogRead(pins[sensor]);
+      sum += calculateResistance(adc, RL_VALUES[sensor]);
+      delay(100);
+      if (i % 5 == 0) Serial.print(".");
+    }
+    
+    float rs_avg = sum / CALIBRATION_SAMPLES;
+    ro_values[sensor] = rs_avg / RO_CLEAN_AIR_FACTORS[sensor];
+    Serial.printf("\n%s: Rs=%.2f kΩ, Ro=%.2f kΩ", names[sensor], rs_avg, ro_values[sensor]);
+  }
+  
+  Serial.println("\n✅ Calibration complete");
+}
+
+// ==================== BLE FUNCTIONS ====================
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.printf("📱 Device connected! Ready to send data.\n");
+    }
+    
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("📱 Device disconnected. Restarting advertising...");
+      delay(500);
+      pServer->startAdvertising();
+    }
+};
+
+void initBLE() {
+  Serial.println("\n🔵 Initializing BLE...");
+  
+  String deviceName = "ESP32_SPOILAGE_" + String(DEVICE_ID);
+  BLEDevice::init(deviceName.c_str());
+  Serial.printf("Device name: %s\n", deviceName.c_str());
+  
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  
+  BLEService *pService = pServer->createService("12345678-1234-5678-9abc-def123456789");
+  
+  pTxCharacteristic = pService->createCharacteristic(
+    "87654321-4321-1234-5678-abc123456789",
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  
+  pTxCharacteristic->addDescriptor(new BLE2902());
+  
+  pService->start();
+  
+  BLEDevice::getAdvertising()->addServiceUUID(pService->getUUID());
+  BLEDevice::getAdvertising()->setScanResponse(true);
+  BLEDevice::getAdvertising()->setMinPreferred(0x06);
+  BLEDevice::getAdvertising()->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  
+  Serial.println("✅ BLE ready - waiting for connections...");
+}
+
+void sendBLEData() {
+  if (!pTxCharacteristic || !deviceConnected) return;
+  
+  StaticJsonDocument<512> doc;
+  
+  doc["id"] = DEVICE_ID;
+  doc["stage"] = spoilageStage;
+  doc["confidence"] = (int)(systemConfidence * 100);
+  
+  JsonObject gas = doc.createNestedObject("gas");
+  gas["nh3"] = round(gas_filtered[0] * 100) / 100.0;
+  gas["h2s"] = round(gas_filtered[1] * 100) / 100.0;
+  gas["co2"] = round(gas_filtered[2] * 100) / 100.0;
+  gas["ch4"] = round(gas_filtered[3] * 100) / 100.0;
+  
+  doc["temp"] = round(temperature * 10) / 10.0;
+  doc["humidity"] = round(humidity * 10) / 10.0;
+  doc["timestamp"] = millis();
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  pTxCharacteristic->setValue(jsonString.c_str());
+  pTxCharacteristic->notify();
+  
+  Serial.printf("📤 Sent: %s\n", jsonString.c_str());
+}
+
+// ==================== SETUP ====================
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("\n===========================================");
+  Serial.println("ESP32-C6 Spoilage Detection (Fixed)");
+  Serial.println("No Cross-Sensitivity - Basic Curves Only");
+  Serial.println("===========================================");
+  Serial.printf("Device ID: %d\n", DEVICE_ID);
+  
+  // Initialize hardware
+  rgbLed.begin();
+  rgbLed.setBrightness(30);
+  setLEDColor(0, 255, 255); // Cyan - initializing
+  
+  // Setup ADC
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  
+  // Setup pins
+  pinMode(MQ137_PIN, INPUT);
+  pinMode(MQ136_PIN, INPUT);
+  pinMode(MQ135_PIN, INPUT);
+  pinMode(MQ4_PIN, INPUT);
+  pinMode(DHT_PIN, INPUT_PULLUP);
+  
+  // Initialize DHT
+  dht.begin();
+  delay(2000);
+  
+  // Quick sensor check
+  Serial.println("\n📊 Sensor Check:");
+  const int pins[NUM_SENSORS] = {MQ137_PIN, MQ136_PIN, MQ135_PIN, MQ4_PIN};
+  const char* names[] = {"MQ137", "MQ136", "MQ135", "MQ4"};
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    int adc = analogRead(pins[i]);
+    float v = (adc / 4095.0f) * VREF_ADC / VOLTAGE_DIVIDER_RATIO;
+    Serial.printf("  %s: ADC=%d, V=%.2f\n", names[i], adc, v);
+  }
+  
+  // Warmup period
+  Serial.printf("\n🔥 Warming up sensors (%d seconds)...\n", WARMUP_TIME);
+  for (int i = 0; i < WARMUP_TIME; i++) {
+    int brightness = (int)((sin(i * 0.2f) + 1.0f) * 127.0f);
+    rgbLed.setPixelColor(0, brightness, brightness, brightness);
+    rgbLed.show();
+    if (i % 5 == 0) Serial.printf("%d%% ", (i * 100) / WARMUP_TIME);
+    delay(1000);
+  }
+  Serial.println("100%");
+  
+  // Calibrate sensors
+  calibrateSensors();
+  
+  // Initialize BLE
+  initBLE();
+  
+  // System ready
+  sensorsReady = true;
+  setLEDColor(0, 255, 0); // Green - ready
+  Serial.println("\n✅ System ready! Broadcasting sensor data...");
+  Serial.println("🔍 Waiting for Flutter app connection...");
+  Serial.println("\nCommands: C=Calibrate, S=Status, R=Restart\n");
+}
+
+// ==================== MAIN LOOP ====================
+
+void loop() {
+  unsigned long now = millis();
+  
+  // Read sensors
+  if (now - lastSensorRead >= 1000) {
+    // Read environmental sensors
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (!isnan(t) && !isnan(h)) {
+      temperature = temperature * 0.8f + t * 0.2f;
+      humidity = humidity * 0.8f + h * 0.2f;
+    }
+    
+    // Read gas sensors
+    if (sensorsReady) {
+      readGasSensors();
+    }
+    
+    lastSensorRead = now;
+  }
+  
+  // Analyze spoilage
+  if (now - lastAnalysis >= ANALYSIS_INTERVAL && sensorsReady) {
+    spoilageStage = detectSpoilage();
+    updateLED();
+    printStatus();
+    lastAnalysis = now;
+  }
+  
+  // Send BLE data
+  if (now - lastDataSent >= DATA_INTERVAL && sensorsReady) {
+    sendBLEData();
+    lastDataSent = now;
+  }
+  
+  // Handle BLE connection changes
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+    Serial.println("📱 Device connected - starting data stream");
+  }
+  
+  if (!deviceConnected && oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+    Serial.println("📱 Device disconnected");
+  }
+  
+  // Handle serial commands
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    switch (cmd) {
+      case 'C':
+      case 'c':
+        Serial.println("\n🔄 Recalibrating sensors...");
+        calibrateSensors();
+        break;
+        
+      case 'S':
+      case 's':
+        printDetailedStatus();
+        break;
+        
+      case 'R':
+      case 'r':
+        Serial.println("\n🔄 Restarting system...");
+        ESP.restart();
+        break;
+    }
+  }
+  
+  delay(10);
+}
+
+// ==================== OUTPUT FUNCTIONS ====================
+
+void printStatus() {
+  const char* stages[] = {"FRESH", "WARNING", "SPOILING", "SPOILED"};
+  const char* gases[] = {"NH3", "H2S", "CO2", "CH4"};
+  
+  Serial.printf("\n[%s] Confidence: %.0f%% | Connected: %s\n", 
+                stages[spoilageStage], 
+                systemConfidence * 100,
+                deviceConnected ? "YES" : "NO");
+  
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    Serial.printf("%s: %.2f ppm ", gases[i], gas_filtered[i]);
+  }
+  Serial.printf("| T: %.1f°C H: %.1f%%\n", temperature, humidity);
+}
+
+void printDetailedStatus() {
+  Serial.println("\n========== DETAILED STATUS ==========");
+  Serial.printf("Device ID: %d\n", DEVICE_ID);
+  Serial.printf("BLE Connected: %s\n", deviceConnected ? "YES" : "NO");
+  Serial.printf("Temperature: %.1f°C, Humidity: %.1f%%\n", temperature, humidity);
+  Serial.printf("Spoilage Stage: %d (%.0f%% confidence)\n", spoilageStage, systemConfidence * 100);
+  
+  Serial.println("\nGas Readings (ppm):");
+  Serial.println("        Raw      Filtered");
+  const char* gases[] = {"NH3", "H2S", "CO2", "CH4"};
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    Serial.printf("%s: %8.2f %10.2f\n", gases[i], gas_ppm[i], gas_filtered[i]);
+  }
+  
+  Serial.println("\nRo Values (kΩ):");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    Serial.printf("  Sensor %d: %.2f\n", i, ro_values[i]);
+  }
+
+  
+  Serial.printf("\nUptime: %.1f minutes\n", millis() / 60000.0f);
+  Serial.println("=====================================");
+}
+
+void updateLED() {
+  const uint32_t colors[] = {
+    rgbLed.Color(0, 255, 0),    // Fresh - Green
+    rgbLed.Color(255, 255, 0),  // Warning - Yellow
+    rgbLed.Color(255, 128, 0),  // Spoiling - Orange
+    rgbLed.Color(255, 0, 0)     // Spoiled - Red
+  };
+  
+  if (deviceConnected) {
+    rgbLed.setPixelColor(0, colors[spoilageStage]);
+  } else {
+    // Blink when not connected
+    uint32_t blinkColor = (millis() / 500) % 2 ? colors[spoilageStage] : rgbLed.Color(0, 0, 255);
+    rgbLed.setPixelColor(0, blinkColor);
+  }
+  
+  rgbLed.show();
+}
+
+void setLEDColor(uint8_t r, uint8_t g, uint8_t b) {
+  rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
+  rgbLed.show();
+}
