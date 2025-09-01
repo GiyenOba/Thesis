@@ -1,0 +1,47 @@
+name: bt
+description: ESP32-C6 Multi-Gas Sensor & Positioning System Monitor
+
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: ">=3.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # Bluetooth Low Energy connectivity
+  flutter_blue_plus: ^1.32.12
+  
+  # Permissions handling
+  permission_handler: ^11.3.1
+  
+  # Charts for gas level visualization
+  fl_chart: ^0.65.0
+  
+  # UI components
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  
+  # Optional: Add app icon and other assets
+  # assets:
+  #   - images/gas_sensor_icon.png
+  #   - images/
+
+  # Optional: Custom fonts
+  # fonts:
+  #   - family: Roboto
+  #     fonts:
+  #       - asset: fonts/Roboto-Regular.ttf
+  #       - asset: fonts/Roboto-Bold.ttf
+  #         weight: 700
