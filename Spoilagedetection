@@ -1,6 +1,6 @@
 /*
- * ESP32-C6 Multi-Gas Spoilage Detection - Fixed Version
- * Removed Cross-Sensitivity Compensation - Using Basic Curves Only
+ * ESP32-C6 Multi-Gas Spoilage Detection - With Baseline Compensation
+ * Baseline compensation sets clean air readings as zero point
  * 
  * Hardware: ESP32-C6, MQ-137/136/135/4, DHT22, RGB LED
  * Voltage Divider: 10kΩ series, 20kΩ to ground (Config A - 2/3 ratio)
@@ -19,12 +19,12 @@
 #include <math.h>
 
 // ==================== CONFIGURATION ====================
-const int DEVICE_ID = 1;  // CHANGE THIS (1-4) for each device
+const int DEVICE_ID = 4;  // CHANGE THIS (1-4) for each device
 
 // Pin assignments
-#define MQ137_PIN    0    // NH3
-#define MQ136_PIN    1    // H2S  
-#define MQ135_PIN    2    // CO2
+#define MQ136_PIN    0    // H2S  
+#define MQ135_PIN    1    // CO2
+#define MQ137_PIN    2    // NH3
 #define MQ4_PIN      3    // CH4
 #define DHT_PIN      4
 #define DHT_TYPE     DHT22
@@ -43,6 +43,7 @@ const float RO_CLEAN_AIR_FACTORS[NUM_SENSORS] = {3.6f, 3.0f, 3.6f, 4.4f};
 
 // Sampling
 #define CALIBRATION_SAMPLES  30
+#define BASELINE_SAMPLES     50  // More samples for stable baseline
 #define READ_SAMPLES        5
 #define WARMUP_TIME         30  // seconds
 
@@ -72,8 +73,10 @@ DHT dht(DHT_PIN, DHT_TYPE);
 
 // Sensor data
 float ro_values[NUM_SENSORS] = {10.0f, 10.0f, 10.0f, 10.0f};
+float baseline_ppm[NUM_SENSORS] = {0, 0, 0, 0};  // Baseline PPM values
 float gas_ppm[NUM_SENSORS];
 float gas_filtered[NUM_SENSORS] = {0, 0, 0, 0};
+bool baseline_calibrated = false;
 
 // Environmental
 float temperature = 20.0f;
@@ -110,29 +113,49 @@ float calculateResistance(float adc_value, float rl_value) {
   return rl_value * ((VCC_SENSOR / v_sensor) - 1.0f);
 }
 
-// Simplified PPM calculation using power law: ppm = A * (Rs/Ro)^B
+// PPM calculation functions with baseline compensation
 float calculatePPM_MQ137(float rs_ro_ratio) {
-  // NH3 curve for MQ-137: ppm = 102 * (Rs/Ro)^(-2.2)
   if (rs_ro_ratio <= 0) return 0;
-  return 102.0f * pow(rs_ro_ratio, -2.2f);
+  float raw_ppm = 102.0f * pow(rs_ro_ratio, -2.2f);
+  
+  if (baseline_calibrated) {
+    raw_ppm = raw_ppm - baseline_ppm[0];
+    return max(0.0f, raw_ppm);  // No negative values
+  }
+  return raw_ppm;
 }
 
 float calculatePPM_MQ136(float rs_ro_ratio) {
-  // H2S curve for MQ-136: ppm = 30 * (Rs/Ro)^(-1.8)
   if (rs_ro_ratio <= 0) return 0;
-  return 30.0f * pow(rs_ro_ratio, -1.8f);
+  float raw_ppm = 30.0f * pow(rs_ro_ratio, -1.8f);
+  
+  if (baseline_calibrated) {
+    raw_ppm = raw_ppm - baseline_ppm[1];
+    return max(0.0f, raw_ppm);  // No negative values
+  }
+  return raw_ppm;
 }
 
 float calculatePPM_MQ135(float rs_ro_ratio) {
-  // CO2 curve for MQ-135: ppm = 116.6 * (Rs/Ro)^(-2.769)
   if (rs_ro_ratio <= 0) return 0;
-  return 116.6f * pow(rs_ro_ratio, -2.769f);
+  float raw_ppm = 116.6f * pow(rs_ro_ratio, -2.769f);
+  
+  if (baseline_calibrated) {
+    raw_ppm = raw_ppm - baseline_ppm[2];
+    return max(0.0f, raw_ppm);  // No negative values
+  }
+  return raw_ppm;
 }
 
 float calculatePPM_MQ4(float rs_ro_ratio) {
-  // CH4 curve for MQ-4: ppm = 1012.7 * (Rs/Ro)^(-2.786)
   if (rs_ro_ratio <= 0) return 0;
-  return 1012.7f * pow(rs_ro_ratio, -2.786f);
+  float raw_ppm = 1012.7f * pow(rs_ro_ratio, -2.786f);
+  
+  if (baseline_calibrated) {
+    raw_ppm = raw_ppm - baseline_ppm[3];
+    return max(0.0f, raw_ppm);  // No negative values
+  }
+  return raw_ppm;
 }
 
 float compensateEnvironment(float ppm, int gas_type, float temp, float hum) {
@@ -142,6 +165,58 @@ float compensateEnvironment(float ppm, int gas_type, float temp, float hum) {
   float hum_factor = 1.0f + 0.002f * (hum - 65.0f);
   
   return ppm * temp_factor * hum_factor;
+}
+
+// ==================== BASELINE CALIBRATION ====================
+
+void calibrateBaseline() {
+  Serial.println("\n📊 Calibrating baseline PPM values in clean air...");
+  Serial.println("⚠️  Ensure sensors are in clean air environment!");
+  
+  const char* gas_names[] = {"NH3", "H2S", "CO2", "CH4"};
+  float sum_ppm[NUM_SENSORS] = {0, 0, 0, 0};
+  
+  // Temporarily disable baseline compensation for raw readings
+  bool temp_baseline_state = baseline_calibrated;
+  baseline_calibrated = false;
+  
+  Serial.println("Taking baseline measurements...");
+  for (int sample = 0; sample < BASELINE_SAMPLES; sample++) {
+    readGasSensors();
+    
+    for (int gas = 0; gas < NUM_SENSORS; gas++) {
+      sum_ppm[gas] += gas_ppm[gas];
+    }
+    
+    if (sample % 10 == 0) {
+      Serial.printf("Progress: %d%% ", (sample * 100) / BASELINE_SAMPLES);
+      for (int gas = 0; gas < NUM_SENSORS; gas++) {
+        Serial.printf("%s:%.1f ", gas_names[gas], gas_ppm[gas]);
+      }
+      Serial.println();
+    }
+    
+    delay(100);
+  }
+  
+  // Calculate and store baseline values
+  Serial.println("\n📈 Baseline Values Established:");
+  for (int gas = 0; gas < NUM_SENSORS; gas++) {
+    baseline_ppm[gas] = sum_ppm[gas] / BASELINE_SAMPLES;
+    Serial.printf("  %s baseline: %.2f ppm\n", gas_names[gas], baseline_ppm[gas]);
+  }
+  
+  // Re-enable baseline compensation
+  baseline_calibrated = true;
+  
+  // Reset filtered values to 0
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    gas_filtered[i] = 0.0f;
+  }
+  
+  Serial.println("✅ Baseline calibration complete!");
+  Serial.println("   All future readings will be offset from these baseline values");
+  Serial.println("   Readings below baseline will show as 0.0 ppm\n");
 }
 
 // ==================== SENSOR READING ====================
@@ -160,7 +235,7 @@ void readGasSensors() {
     float rs = calculateResistance(adc_avg, RL_VALUES[sensor]);
     float ratio = rs / ro_values[sensor];
     
-    // Calculate PPM using individual sensor curves
+    // Calculate PPM using individual sensor curves (with baseline compensation)
     switch (sensor) {
       case 0: gas_ppm[sensor] = calculatePPM_MQ137(ratio); break;
       case 1: gas_ppm[sensor] = calculatePPM_MQ136(ratio); break;
@@ -228,7 +303,7 @@ int detectSpoilage() {
 // ==================== CALIBRATION ====================
 
 void calibrateSensors() {
-  Serial.println("\n🔬 Calibrating sensors in clean air...");
+  Serial.println("\n🔬 Calibrating sensor resistance (Ro) in clean air...");
   const int pins[NUM_SENSORS] = {MQ137_PIN, MQ136_PIN, MQ135_PIN, MQ4_PIN};
   const char* names[] = {"MQ137", "MQ136", "MQ135", "MQ4"};
   
@@ -247,7 +322,7 @@ void calibrateSensors() {
     Serial.printf("\n%s: Rs=%.2f kΩ, Ro=%.2f kΩ", names[sensor], rs_avg, ro_values[sensor]);
   }
   
-  Serial.println("\n✅ Calibration complete");
+  Serial.println("\n✅ Resistance calibration complete");
 }
 
 // ==================== BLE FUNCTIONS ====================
@@ -304,6 +379,7 @@ void sendBLEData() {
   doc["id"] = DEVICE_ID;
   doc["stage"] = spoilageStage;
   doc["confidence"] = (int)(systemConfidence * 100);
+  doc["baseline_cal"] = baseline_calibrated;
   
   JsonObject gas = doc.createNestedObject("gas");
   gas["nh3"] = round(gas_filtered[0] * 100) / 100.0;
@@ -331,8 +407,8 @@ void setup() {
   delay(2000);
   
   Serial.println("\n===========================================");
-  Serial.println("ESP32-C6 Spoilage Detection (Fixed)");
-  Serial.println("No Cross-Sensitivity - Basic Curves Only");
+  Serial.println("ESP32-C6 Spoilage Detection");
+  Serial.println("With Baseline Compensation");
   Serial.println("===========================================");
   Serial.printf("Device ID: %d\n", DEVICE_ID);
   
@@ -377,8 +453,25 @@ void setup() {
   }
   Serial.println("100%");
   
-  // Calibrate sensors
+  // Calibrate sensor resistance (Ro)
   calibrateSensors();
+  
+  // Calibrate baseline PPM values
+  Serial.println("\n⚠️  IMPORTANT: Ensure sensors are in CLEAN AIR!");
+  Serial.println("   Press any key to continue with baseline calibration, or 'S' to skip...");
+  
+  // Wait for user input
+  while (!Serial.available()) {
+    delay(100);
+  }
+  
+  char response = Serial.read();
+  if (response != 'S' && response != 's') {
+    calibrateBaseline();
+  } else {
+    Serial.println("⏭️  Baseline calibration skipped. Use 'Z' command to calibrate later.");
+    baseline_calibrated = false;
+  }
   
   // Initialize BLE
   initBLE();
@@ -388,7 +481,7 @@ void setup() {
   setLEDColor(0, 255, 0); // Green - ready
   Serial.println("\n✅ System ready! Broadcasting sensor data...");
   Serial.println("🔍 Waiting for Flutter app connection...");
-  Serial.println("\nCommands: C=Calibrate, S=Status, R=Restart\n");
+  Serial.println("\nCommands: C=Calibrate Ro, Z=Zero baseline, S=Status, R=Restart\n");
 }
 
 // ==================== MAIN LOOP ====================
@@ -445,8 +538,16 @@ void loop() {
     switch (cmd) {
       case 'C':
       case 'c':
-        Serial.println("\n🔄 Recalibrating sensors...");
+        Serial.println("\n🔄 Recalibrating sensor resistance (Ro)...");
         calibrateSensors();
+        break;
+        
+      case 'Z':
+      case 'z':
+        Serial.println("\n🔄 Calibrating baseline (zero point)...");
+        Serial.println("⚠️  Make sure sensors are in CLEAN AIR!");
+        delay(3000);
+        calibrateBaseline();
         break;
         
       case 'S':
@@ -471,10 +572,11 @@ void printStatus() {
   const char* stages[] = {"FRESH", "WARNING", "SPOILING", "SPOILED"};
   const char* gases[] = {"NH3", "H2S", "CO2", "CH4"};
   
-  Serial.printf("\n[%s] Confidence: %.0f%% | Connected: %s\n", 
+  Serial.printf("\n[%s] Confidence: %.0f%% | Connected: %s | Baseline: %s\n", 
                 stages[spoilageStage], 
                 systemConfidence * 100,
-                deviceConnected ? "YES" : "NO");
+                deviceConnected ? "YES" : "NO",
+                baseline_calibrated ? "CAL" : "RAW");
   
   for (int i = 0; i < NUM_SENSORS; i++) {
     Serial.printf("%s: %.2f ppm ", gases[i], gas_filtered[i]);
@@ -486,6 +588,7 @@ void printDetailedStatus() {
   Serial.println("\n========== DETAILED STATUS ==========");
   Serial.printf("Device ID: %d\n", DEVICE_ID);
   Serial.printf("BLE Connected: %s\n", deviceConnected ? "YES" : "NO");
+  Serial.printf("Baseline Calibrated: %s\n", baseline_calibrated ? "YES" : "NO");
   Serial.printf("Temperature: %.1f°C, Humidity: %.1f%%\n", temperature, humidity);
   Serial.printf("Spoilage Stage: %d (%.0f%% confidence)\n", spoilageStage, systemConfidence * 100);
   
@@ -496,11 +599,17 @@ void printDetailedStatus() {
     Serial.printf("%s: %8.2f %10.2f\n", gases[i], gas_ppm[i], gas_filtered[i]);
   }
   
+  if (baseline_calibrated) {
+    Serial.println("\nBaseline Values (ppm):");
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      Serial.printf("  %s: %.2f\n", gases[i], baseline_ppm[i]);
+    }
+  }
+  
   Serial.println("\nRo Values (kΩ):");
   for (int i = 0; i < NUM_SENSORS; i++) {
     Serial.printf("  Sensor %d: %.2f\n", i, ro_values[i]);
   }
-
   
   Serial.printf("\nUptime: %.1f minutes\n", millis() / 60000.0f);
   Serial.println("=====================================");
@@ -515,9 +624,15 @@ void updateLED() {
   };
   
   if (deviceConnected) {
-    rgbLed.setPixelColor(0, colors[spoilageStage]);
+    if (!baseline_calibrated) {
+      // Purple blink when baseline not calibrated
+      uint32_t color = (millis() / 300) % 2 ? rgbLed.Color(128, 0, 128) : colors[spoilageStage];
+      rgbLed.setPixelColor(0, color);
+    } else {
+      rgbLed.setPixelColor(0, colors[spoilageStage]);
+    }
   } else {
-    // Blink when not connected
+    // Blue blink when not connected
     uint32_t blinkColor = (millis() / 500) % 2 ? colors[spoilageStage] : rgbLed.Color(0, 0, 255);
     rgbLed.setPixelColor(0, blinkColor);
   }
